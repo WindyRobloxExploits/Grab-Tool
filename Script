@@ -1,0 +1,545 @@
+-- Delta Executor Compatible Grab Tool
+-- Optimized | Z=closer X=further | F=throw | Mobile + PC
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local Debris = game:GetService("Debris")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local character = player.Character or player.CharacterAdded:Wait()
+local camera = workspace.CurrentCamera
+local mouse = player:GetMouse()
+
+player.CharacterAdded:Connect(function(c)
+    character = c
+end)
+
+-- Settings
+local throwForce = 80
+local throwUpForce = 20
+local grabRange = 60
+local holdDepth = 15
+
+-- Depth control
+local currentDepth = holdDepth
+local depthMin = 3
+local depthMax = 100
+local depthStep = 0.4
+local mobilePullClose = false
+local mobilePushFar = false
+
+-- State
+local heldPart = nil
+local originalCollision = {}
+local heartbeatConn = nil
+local bodyVelocity = nil
+local bodyGyro = nil
+local gui = nil
+local statusLabel = nil
+local toolEquipped = false
+local isMobile = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+local touchPos = Vector2.new(0, 0)
+
+-- Highlights
+local highlights = {}
+local scanConn = nil
+
+-- =====================
+-- HIGHLIGHT SYSTEM
+-- =====================
+
+local function isLoosePart(part)
+    if not part or not part:IsA("BasePart") then return false end
+    if part.Anchored then return false end
+    if not part.Parent then return false end
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character and part:IsDescendantOf(p.Character) then return false end
+    end
+    if part:FindFirstAncestorOfClass("Tool") then return false end
+    return true
+end
+
+local function addHighlight(part)
+    if highlights[part] then return end
+    local sel = Instance.new("SelectionBox")
+    sel.Adornee = part
+    sel.Color3 = Color3.fromRGB(255, 80, 0)
+    sel.LineThickness = 0.04
+    sel.SurfaceTransparency = 0.8
+    sel.SurfaceColor3 = Color3.fromRGB(255, 140, 0)
+    sel.Parent = workspace
+    highlights[part] = sel
+end
+
+local function removeHighlight(part)
+    if highlights[part] then
+        highlights[part]:Destroy()
+        highlights[part] = nil
+    end
+end
+
+local function clearAllHighlights()
+    for part, sel in pairs(highlights) do
+        if sel then sel:Destroy() end
+    end
+    highlights = {}
+end
+
+local function startScanner()
+    if scanConn then return end
+    local tick = 0
+    scanConn = RunService.Heartbeat:Connect(function(dt)
+        tick = tick + dt
+        if tick < 0.5 then return end
+        tick = 0
+        if not toolEquipped then return end
+
+        local rootPart = character and character:FindFirstChild("HumanoidRootPart")
+        if not rootPart then return end
+
+        local current = {}
+        for _, obj in ipairs(workspace:GetPartBoundsInRadius(rootPart.Position, grabRange + 20)) do
+            if isLoosePart(obj) and obj ~= heldPart then
+                current[obj] = true
+            end
+        end
+
+        for part in pairs(current) do addHighlight(part) end
+        for part in pairs(highlights) do
+            if not current[part] then removeHighlight(part) end
+        end
+    end)
+end
+
+local function stopScanner()
+    if scanConn then scanConn:Disconnect() scanConn = nil end
+    clearAllHighlights()
+end
+
+-- =====================
+-- TOOL
+-- =====================
+
+local grabTool = Instance.new("Tool")
+grabTool.Name = "Grab"
+grabTool.RequiresHandle = false
+grabTool.ToolTip = "Grab & Throw"
+
+local handle = Instance.new("Part")
+handle.Name = "Handle"
+handle.Size = Vector3.new(0.5, 0.5, 0.5)
+handle.Transparency = 1
+handle.CanCollide = false
+handle.Parent = grabTool
+
+-- =====================
+-- GUI
+-- =====================
+
+local function createGUI()
+    if gui then gui:Destroy() end
+
+    gui = Instance.new("ScreenGui")
+    gui.Name = "GrabToolGUI"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    pcall(function() gui.Parent = game:GetService("CoreGui") end)
+    if not gui.Parent then gui.Parent = player.PlayerGui end
+
+    -- Main panel
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 230, 0, 190)
+    frame.Position = UDim2.new(0, 12, 1, -202)
+    frame.AnchorPoint = Vector2.new(0, 1)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 22)
+    frame.BackgroundTransparency = 0.1
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+    local stroke = Instance.new("UIStroke", frame)
+    stroke.Color = Color3.fromRGB(255, 80, 0)
+    stroke.Thickness = 1.5
+    stroke.Transparency = 0.35
+
+    -- Title bar
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 32)
+    titleBar.BackgroundColor3 = Color3.fromRGB(255, 80, 0)
+    titleBar.BackgroundTransparency = 0.15
+    titleBar.BorderSizePixel = 0
+    titleBar.Parent = frame
+    Instance.new("UICorner", titleBar).CornerRadius = UDim.new(0, 10)
+
+    local fix = Instance.new("Frame")
+    fix.Size = UDim2.new(1, 0, 0.5, 0)
+    fix.Position = UDim2.new(0, 0, 0.5, 0)
+    fix.BackgroundColor3 = Color3.fromRGB(255, 80, 0)
+    fix.BackgroundTransparency = 0.15
+    fix.BorderSizePixel = 0
+    fix.Parent = titleBar
+
+    local titleLbl = Instance.new("TextLabel")
+    titleLbl.Text = "⚡ GRAB TOOL"
+    titleLbl.Size = UDim2.new(1, 0, 1, 0)
+    titleLbl.BackgroundTransparency = 1
+    titleLbl.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLbl.Font = Enum.Font.GothamBold
+    titleLbl.TextSize = 13
+    titleLbl.Parent = titleBar
+
+    -- Status
+    local sLbl = Instance.new("TextLabel")
+    sLbl.Name = "Status"
+    sLbl.Text = "Status: Idle"
+    sLbl.Size = UDim2.new(1, -10, 0, 18)
+    sLbl.Position = UDim2.new(0, 5, 0, 36)
+    sLbl.BackgroundTransparency = 1
+    sLbl.TextColor3 = Color3.fromRGB(100, 255, 100)
+    sLbl.Font = Enum.Font.Gotham
+    sLbl.TextSize = 11
+    sLbl.TextXAlignment = Enum.TextXAlignment.Left
+    sLbl.Parent = frame
+    statusLabel = sLbl
+
+    -- Hint
+    local hintLbl = Instance.new("TextLabel")
+    hintLbl.Text = isMobile
+        and "Tap=Grab | Drag=Move | Lift=Throw | ◀▶=Depth"
+        or  "Click=Grab | F=Throw | RClick=Drop | Z/X=Depth"
+    hintLbl.Size = UDim2.new(1, -10, 0, 14)
+    hintLbl.Position = UDim2.new(0, 5, 0, 54)
+    hintLbl.BackgroundTransparency = 1
+    hintLbl.TextColor3 = Color3.fromRGB(130, 130, 150)
+    hintLbl.Font = Enum.Font.Gotham
+    hintLbl.TextSize = 10
+    hintLbl.TextXAlignment = Enum.TextXAlignment.Left
+    hintLbl.Parent = frame
+
+    local function makeRow(label, val, y, minV, maxV, cb)
+        local lbl = Instance.new("TextLabel")
+        lbl.Text = label
+        lbl.Size = UDim2.new(0.56, 0, 0, 18)
+        lbl.Position = UDim2.new(0, 8, 0, y)
+        lbl.BackgroundTransparency = 1
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 200)
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 11
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = frame
+
+        local box = Instance.new("TextBox")
+        box.Size = UDim2.new(0.35, 0, 0, 22)
+        box.Position = UDim2.new(0.62, 0, 0, y - 2)
+        box.Text = tostring(val)
+        box.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+        box.TextColor3 = Color3.fromRGB(255, 180, 80)
+        box.Font = Enum.Font.GothamBold
+        box.TextSize = 12
+        box.ClearTextOnFocus = false
+        box.BorderSizePixel = 0
+        box.Parent = frame
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+
+        box.FocusLost:Connect(function()
+            local v = tonumber(box.Text)
+            if v and v >= minV and v <= maxV then cb(v)
+            else box.Text = tostring(val) end
+        end)
+    end
+
+    makeRow("Throw Force:",  throwForce,   76,  1, 500, function(v) throwForce = v end)
+    makeRow("Up Force:",     throwUpForce, 104, 0, 200, function(v) throwUpForce = v end)
+    makeRow("Grab Range:",   grabRange,    132, 5, 200, function(v) grabRange = v end)
+    makeRow("Hold Depth:",   holdDepth,    160, 2, 100, function(v)
+        holdDepth = v
+        currentDepth = v
+    end)
+
+    -- Mobile Z/X buttons (floating, centred vertically on screen sides)
+    if isMobile then
+        local function makeDepthBtn(text, xPos, onDown, onUp)
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(0, 58, 0, 58)
+            btn.Position = xPos
+            btn.Text = text
+            btn.BackgroundColor3 = Color3.fromRGB(30, 30, 38)
+            btn.BackgroundTransparency = 0.2
+            btn.TextColor3 = Color3.fromRGB(255, 180, 80)
+            btn.Font = Enum.Font.GothamBold
+            btn.TextSize = 14
+            btn.BorderSizePixel = 0
+            btn.Parent = gui
+            Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 10)
+            local stroke2 = Instance.new("UIStroke", btn)
+            stroke2.Color = Color3.fromRGB(255, 80, 0)
+            stroke2.Thickness = 1.2
+            stroke2.Transparency = 0.4
+
+            btn.MouseButton1Down:Connect(onDown)
+            btn.MouseButton1Up:Connect(onUp)
+            btn.TouchLongPress:Connect(onDown)
+            return btn
+        end
+
+        makeDepthBtn("◀\nNEAR",
+            UDim2.new(0, 10, 0.5, -29),
+            function() mobilePullClose = true end,
+            function() mobilePullClose = false end
+        )
+        makeDepthBtn("FAR\n▶",
+            UDim2.new(1, -68, 0.5, -29),
+            function() mobilePushFar = true end,
+            function() mobilePushFar = false end
+        )
+
+        -- Mobile throw button inside panel
+        local throwBtn = Instance.new("TextButton")
+        throwBtn.Size = UDim2.new(0, 90, 0, 28)
+        throwBtn.Position = UDim2.new(0.5, -45, 0, 158)
+        throwBtn.Text = "🚀 THROW"
+        throwBtn.BackgroundColor3 = Color3.fromRGB(255, 80, 0)
+        throwBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        throwBtn.Font = Enum.Font.GothamBold
+        throwBtn.TextSize = 11
+        throwBtn.BorderSizePixel = 0
+        throwBtn.Parent = frame
+        Instance.new("UICorner", throwBtn).CornerRadius = UDim.new(0, 6)
+        throwBtn.Activated:Connect(function()
+            if heldPart then throwItem() end
+        end)
+    end
+end
+
+-- =====================
+-- CURSOR WORLD POSITION
+-- =====================
+
+local function getCursorWorldPos(screenPos)
+    local unitRay = camera:ScreenPointToRay(screenPos.X, screenPos.Y)
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {character, heldPart}
+    params.FilterType = Enum.RaycastFilterType.Exclude
+
+    -- Always use currentDepth so Z/X directly controls where part floats
+    return unitRay.Origin + unitRay.Direction * currentDepth
+end
+
+-- =====================
+-- GRAB
+-- =====================
+
+local function grabPart(part)
+    if heldPart then return end
+    if not isLoosePart(part) then return end
+
+    heldPart = part
+    currentDepth = holdDepth
+    originalCollision[part] = part.CanCollide
+    part.CanCollide = false
+    removeHighlight(part)
+
+    if bodyGyro then bodyGyro:Destroy() end
+    bodyGyro = Instance.new("BodyGyro")
+    bodyGyro.MaxTorque = Vector3.new(1e6, 1e6, 1e6)
+    bodyGyro.P = 1e5
+    bodyGyro.D = 500
+    bodyGyro.CFrame = part.CFrame
+    bodyGyro.Parent = part
+
+    if bodyVelocity then bodyVelocity:Destroy() end
+    bodyVelocity = Instance.new("BodyVelocity")
+    bodyVelocity.Velocity = Vector3.zero
+    bodyVelocity.MaxForce = Vector3.new(1e8, 1e8, 1e8)
+    bodyVelocity.P = 1e5
+    bodyVelocity.Parent = part
+
+    -- Cache gravity compensation (calculated once, not every frame)
+    local gravityComp = workspace.Gravity * part:GetMass() * 0.016
+
+    if heartbeatConn then heartbeatConn:Disconnect() end
+    heartbeatConn = RunService.Heartbeat:Connect(function()
+        if not heldPart or not bodyVelocity or not bodyVelocity.Parent then
+            if heartbeatConn then heartbeatConn:Disconnect() heartbeatConn = nil end
+            return
+        end
+
+        -- Z / X depth control (keyboard or mobile buttons)
+        local zDown = UserInputService:IsKeyDown(Enum.KeyCode.Z) or mobilePullClose
+        local xDown = UserInputService:IsKeyDown(Enum.KeyCode.X) or mobilePushFar
+        if zDown then
+            currentDepth = math.max(depthMin, currentDepth - depthStep)
+        elseif xDown then
+            currentDepth = math.min(depthMax, currentDepth + depthStep)
+        end
+
+        -- Chase cursor target
+        local screenPos = isMobile and touchPos or Vector2.new(mouse.X, mouse.Y)
+        local targetPos = getCursorWorldPos(screenPos)
+        local diff = targetPos - heldPart.Position
+        local dist = diff.Magnitude
+        local speed = math.clamp(dist * 25, 0, 500)
+
+        bodyVelocity.Velocity = (dist > 0.05)
+            and (diff.Unit * speed + Vector3.new(0, gravityComp, 0))
+            or Vector3.new(0, gravityComp, 0)
+    end)
+
+    if statusLabel then
+        statusLabel.Text = "Status: Holding " .. part.Name
+        statusLabel.TextColor3 = Color3.fromRGB(255, 180, 80)
+    end
+end
+
+-- =====================
+-- THROW
+-- =====================
+
+function throwItem()
+    if not heldPart then return end
+    local part = heldPart
+    heldPart = nil
+
+    if heartbeatConn then heartbeatConn:Disconnect() heartbeatConn = nil end
+    if bodyVelocity  then bodyVelocity:Destroy()  bodyVelocity = nil  end
+    if bodyGyro      then bodyGyro:Destroy()       bodyGyro = nil      end
+
+    if originalCollision[part] ~= nil then
+        part.CanCollide = originalCollision[part]
+        originalCollision[part] = nil
+    end
+
+    currentDepth = holdDepth
+
+    local tv = Instance.new("BodyVelocity")
+    tv.Velocity = camera.CFrame.LookVector * throwForce + Vector3.new(0, throwUpForce, 0)
+    tv.MaxForce = Vector3.new(1e6, 1e6, 1e6)
+    tv.Parent = part
+    Debris:AddItem(tv, 0.35)
+
+    if statusLabel then
+        statusLabel.Text = "Status: Idle"
+        statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    end
+end
+
+-- =====================
+-- DROP
+-- =====================
+
+local function dropItem()
+    if not heldPart then return end
+    local part = heldPart
+    heldPart = nil
+
+    if heartbeatConn then heartbeatConn:Disconnect() heartbeatConn = nil end
+    if bodyVelocity  then bodyVelocity:Destroy()  bodyVelocity = nil  end
+    if bodyGyro      then bodyGyro:Destroy()       bodyGyro = nil      end
+
+    if originalCollision[part] ~= nil then
+        part.CanCollide = originalCollision[part]
+        originalCollision[part] = nil
+    end
+
+    currentDepth = holdDepth
+
+    if statusLabel then
+        statusLabel.Text = "Status: Idle"
+        statusLabel.TextColor3 = Color3.fromRGB(100, 255, 100)
+    end
+end
+
+-- =====================
+-- PC INPUT
+-- =====================
+
+grabTool.Activated:Connect(function()
+    if heldPart then throwItem() return end
+
+    local unitRay = camera:ScreenPointToRay(mouse.X, mouse.Y)
+    local params = RaycastParams.new()
+    params.FilterDescendantsInstances = {character}
+    params.FilterType = Enum.RaycastFilterType.Exclude
+
+    local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * grabRange, params)
+    if result and result.Instance and isLoosePart(result.Instance) then
+        grabPart(result.Instance)
+    end
+end)
+
+UserInputService.InputBegan:Connect(function(input, processed)
+    if processed then return end
+    if not toolEquipped then return end
+
+    if input.KeyCode == Enum.KeyCode.F then
+        if heldPart then throwItem() end
+    end
+
+    if input.UserInputType == Enum.UserInputType.MouseButton2 then
+        dropItem()
+    end
+end)
+
+-- =====================
+-- MOBILE INPUT
+-- =====================
+
+if isMobile then
+    local grabbing = false
+
+    UserInputService.TouchStarted:Connect(function(touch, processed)
+        if processed then return end
+        if not toolEquipped then return end
+        touchPos = Vector2.new(touch.Position.X, touch.Position.Y)
+        if heldPart then return end
+
+        local unitRay = camera:ScreenPointToRay(touch.Position.X, touch.Position.Y)
+        local params = RaycastParams.new()
+        params.FilterDescendantsInstances = {character}
+        params.FilterType = Enum.RaycastFilterType.Exclude
+
+        local result = workspace:Raycast(unitRay.Origin, unitRay.Direction * grabRange, params)
+        if result and result.Instance and isLoosePart(result.Instance) then
+            grabbing = true
+            grabPart(result.Instance)
+        end
+    end)
+
+    UserInputService.TouchMoved:Connect(function(touch, processed)
+        touchPos = Vector2.new(touch.Position.X, touch.Position.Y)
+    end)
+
+    UserInputService.TouchEnded:Connect(function(touch, processed)
+        if grabbing and heldPart then
+            throwItem()
+            grabbing = false
+        end
+    end)
+end
+
+-- =====================
+-- EQUIP / UNEQUIP
+-- =====================
+
+grabTool.Equipped:Connect(function()
+    toolEquipped = true
+    createGUI()
+    startScanner()
+end)
+
+grabTool.Unequipped:Connect(function()
+    toolEquipped = false
+    mobilePullClose = false
+    mobilePushFar = false
+    dropItem()
+    stopScanner()
+    if gui then gui:Destroy() gui = nil end
+    statusLabel = nil
+end)
+
+grabTool.Parent = player.Backpack
+
+print("[GrabTool] Loaded!")
+print("[GrabTool] PC: Click=Grab | Mouse=Drag | F/Click=Throw | RClick=Drop | Z=Closer | X=Further")
+print("[GrabTool] Mobile: Tap=Grab | Drag=Move | Lift finger=Throw | ◀NEAR / FAR▶ buttons for depth")
